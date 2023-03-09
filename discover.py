@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 """
-
  .SYNOPSIS
     MPP Migration Hardware Revision Discovery
 
@@ -13,70 +12,73 @@
     7. Gather the Device's hardware UDI info from DeviceInformationX. This is the timeconsuming part, so provide a progress bar for each chunk
     8. Write the results as found to CSV
     9. Also write any AXL only phones that may be inactive in RIS data
- 
+
  .NOTES
     Author:        Collin Moerman
-    Date:          2023-03-07
-    Version:       1.0
- 
+    Date:          2023-03-09
+    Version:       2.0
 """
-import csv, os, sys, re, argparse
+import csv
+import os
+import sys
+import re
+import errno
+import argparse
+import requests
 from zeep import Client
 from zeep.cache import SqliteCache
 from zeep.transports import Transport
-from zeep.exceptions import Fault
 from zeep.plugins import HistoryPlugin
 from requests import Session
 from requests.auth import HTTPBasicAuth
 from urllib3 import disable_warnings
 from urllib3.exceptions import InsecureRequestWarning
 from lxml import etree
-import requests
 
-import pprint
-pp = pprint.PrettyPrinter(indent=4)
+def progressBar(current:int, total:int, status:str='') -> None:
+    """Display a progress bar on console
 
-def progress(count, total, status=''):
-    if total == 0: return
-    bar_len = 30
-    filled_len = int(round(bar_len * count / float(total)))
-    percents = round(100.0 * count / float(total), 1)
-    bar = '=' * filled_len + ' ' * (bar_len - filled_len)
-    sys.stdout.write('\r[%s] %06.2f%%\t%s\r' % (bar, percents, status))
-    sys.stdout.flush()
-#def
-
-def UniqueKeys(arr):
-    return list(set(val for dic in arr for val in dic.keys()))
-#def
-
-def show_history():
-    for item in [history.last_sent, history.last_received]:
-        print(etree.tostring(item["envelope"], encoding="unicode", pretty_print=True))
-    #for
+    Args:
+        current (int): Current progress amount
+        total (int): Total amount to calculate percentage against
+        status (str, optional): Optional message to display after the progress bar. Defaults to ''.
+    """
+    if total == 0:
+        return
+    barLen = 30
+    filledLen = int(round(barLen * current / float(total)))
+    percents = round(100.0 * current / float(total), 1)
+    barFill = '=' * filledLen + ' ' * (barLen - filledLen)
+    if current == total:
+        print(f'\r[{barFill}] {percents:06.2f}%    {status}')
+    else:
+        sys.stdout.write(f'\r[{barFill}] {percents:06.2f}%    {status}\r')
+        sys.stdout.flush()
+    #if
 #def
 
 def getFirstZeepItem(resp):
+    """Take Zeep's AXL response format and grab the first item from it, AXL result is in a list with one item
+
+    Args:
+        resp (object): Zeep response object from WSDL request
+
+    Returns:
+        object: The nested obeject from the return
+    """
     return resp['return'][next(iter(resp['return']))]
 #def
 
-hw_models = [
-    "Cisco 7821",
-    "Cisco 7861",
-    "Cisco 7841"
-]
-
-if __name__=="__main__":
-    argp = argparse.ArgumentParser(description='Discover Phone Hardware revisions for migration to Webex Calling')
-    argp.add_argument('-s', dest='host', metavar='cucm.example.com', type=str, required=True, help='Server FQDN or IP address')
-    argp.add_argument('-u', dest='username', metavar='axladmin', type=str, required=True, help='Application user with AXL, RIS, and Phone API access')
-    argp.add_argument('-p', dest='password', metavar='@xL!sC00l', type=str, required=True, help='Application user password')
-    argp.add_argument('-o', dest='f_out', default='', metavar='c:\\path\\to\\file.csv',  type=argparse.FileType('w'), help='CSV output document')
-    args = argp.parse_args()
-
-    columns = [
-        'Name', 
-        'Model', 
+class Application:
+    """ Applicaton logic """
+    __HW_MODELS = [
+        "Cisco 7821",
+        "Cisco 7861",
+        "Cisco 7841"
+    ]
+    __DATA_COLUMNS = [
+        'Name',
+        'Model',
         'Description',
         'Status',
         'ActiveLoadID',
@@ -87,125 +89,266 @@ if __name__=="__main__":
         'HardwareRevision',
         'Error'
     ]
-    output = csv.DictWriter(args.f_out, fieldnames=columns, lineterminator='\n', quoting=csv.QUOTE_ALL)
-    output.writeheader()
+    def __init__(self, arguments):
+        self._hostname = arguments.host
+        self._username = arguments.username
+        self._password = arguments.password
+        self._outFile = arguments.outFile
+        self._schemaPath = arguments.schemaPath
+        self._phoneData = {}
+        self._axlVersion = "10.0"  # Default to AXL 10.0 as a minimum version supported
+    #def
 
-    disable_warnings(InsecureRequestWarning)
+    def __str__(self):
+        return "Discover phone hardware revisions for migration to MPP Firmware"
+    #def
+    def __repr__(self):
+        return f'{self._hostname}'
+    #def
 
-    #determine CUCM major version using UDS API
-    udslocation = 'https://{host}/cucm-uds/version'.format(host=args.host)
-    udssession = Session()
-    udssession.verify = False
-    udsResp = udssession.get(udslocation)
-    udsXML = etree.fromstring(bytes(udsResp.text, encoding='utf8'))
-    version = udsXML.xpath('//version/text()')[0]
-    major_ver = re.sub(r'(\d+\.\d+).*', r'\1', version, 0)
-
-    axlwsdl = 'schema\\{ver}\\AXLAPI.wsdl'.format(ver=major_ver)
-    axllocation = 'https://{host}:8443/axl/'.format(host=args.host)
-    axlbinding = "{http://www.cisco.com/AXLAPIService/}AXLAPIBinding"
-    axlsession = Session()
-    axlsession.verify = False
-    axlsession.auth = HTTPBasicAuth(args.username, args.password)
-    axltransport = Transport(cache=SqliteCache(), session=axlsession, timeout=20)
-    axlhistory = HistoryPlugin()
-    axlclient = Client(wsdl=axlwsdl, transport=axltransport, plugins=[axlhistory])
-    axl = axlclient.create_service(axlbinding, axllocation)
-
-    PhoneListRes = getFirstZeepItem(axl.listPhone(searchCriteria={'name':'SEP%'}, returnedTags={'name':'','model':'','description':''}))
-    hw_phones = {}
-    #chunk of up to 900 phones
-    ris_phones_split = []
-    ris_phones = []
-    for phone in PhoneListRes:
-        if phone.model in hw_models:
-            hw_phones[phone.name] = {
-                'Name': phone.name, 
-                'Model': phone.model, 
-                'Description': phone.description,
-                'Status':'',
-                'ActiveLoadID':'',
-                'InactiveLoadID':'',
-                'IPAddress':'',
-                'SerialNumber':'',
-                'ModelNumber':'',
-                'HardwareRevision':'',
-                'Error':''
-            }
-            ris_phones.append(phone.name)
-            #add to the split list after 900 phones
-            if len(ris_phones) > 899:
-                ris_phones_split.append(wxc_phones)
-                ris_phones = []
-            #if
+    def getAxlVersion(self):
+        """Determine CUCM AXL version using UDS API's version string
+        """
+        disable_warnings(InsecureRequestWarning)
+        udsLocation = f'https://{self._hostname}/cucm-uds/version'
+        udsSession = Session()
+        udsSession.verify = False
+        udsResp = udsSession.get(udsLocation)
+        udsXML = etree.fromstring(bytes(udsResp.text, encoding='utf8'))
+        version = udsXML.xpath('//version/text()')[0]
+        if re.search(r'(\d+\.\d+).*', version):
+            self._axlVersion = re.sub(r'(\d+\.\d+).*', r'\1', version, 0)
         #if
-    #for
-    ris_phones_split.append(ris_phones)
-    print('Count of Devices for Hardware Revision Validation: {dev}'.format(dev=len(hw_phones))) 
+    #def
 
-    riswsdl = 'https://{host}:8443/realtimeservice2/services/RISService70?wsdl'.format(host=args.host)
-    rislocation = 'https://{host}:8443/realtimeservice2/services/RISService70'.format(host=args.host)
-    risbinding = '{http://schemas.cisco.com/ast/soap}RisBinding'
-    rissession = Session()
-    rissession.verify = False
-    rissession.auth = HTTPBasicAuth(args.username, args.password)
-    ristransport = Transport(cache=SqliteCache(), session=rissession, timeout=20)
-    rishistory = HistoryPlugin()
-    risclient = Client(wsdl=riswsdl, transport=ristransport, plugins=[rishistory])
-    ris = risclient.create_service(risbinding, rislocation)
-    for ris_phones in ris_phones_split:
+    def getAxlHwPhones(self):
+        """Query AXL for physical (SEP) phones, filter to models with HW revision requirements
+        """
+        disable_warnings(InsecureRequestWarning)
+        axlWSDL = f'{self._schemaPath}\\{self._axlVersion}\\AXLAPI.wsdl'
+        if not os.path.isfile(axlWSDL):
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), axlWSDL)
+        #if
+        axlLocation = f'https://{self._hostname}:8443/axl/'
+        axlBinding = "{http://www.cisco.com/AXLAPIService/}AXLAPIBinding"
+        axlSession = Session()
+        axlSession.verify = False
+        axlSession.auth = HTTPBasicAuth(self._username, self._password)
+        axlTransport = Transport(cache=SqliteCache(), session=axlSession, timeout=20)
+        axlHistory = HistoryPlugin()
+        axlclient = Client(wsdl=axlWSDL, transport=axlTransport, plugins=[axlHistory])
+        axl = axlclient.create_service(axlBinding, axlLocation)
+
+        axlPhones = getFirstZeepItem(axl.listPhone(searchCriteria={'name':'SEP%'}, returnedTags={'name':'','model':'','description':''}))
+        for phone in axlPhones:
+            if phone.model in self.__HW_MODELS:
+                # Initialize dictionary based on data columns
+                self._phoneData[phone.name] = {column: None for column in self.__DATA_COLUMNS}
+                self._phoneData[phone.name]['Name'] =  phone.name
+                self._phoneData[phone.name]['Model'] = phone.model
+                self._phoneData[phone.name]['Description'] = phone.description
+            #if
+        #for
+    #def
+
+    @staticmethod
+    def getChunks(fullList:list, chunksize:int=900) -> list:
+        """Take a list and chunk it into multiple lists with a maximum size per list
+
+        Args:
+            fullList (list): Full list of arbitrary length
+            chunksize (int, optional): The maximum size of each list chunk. Defaults to 900.
+
+        Returns:
+            list: List of lists with chunksize limit imposed
+        """
+        chunkList = []
+        tempList = []
+        for phone in fullList:
+            tempList.append(phone['Name'])
+            #Size reached, chunk now
+            if len(tempList) > (chunksize - 1):
+                chunkList.append(tempList)
+                tempList = []
+            #if
+        #for
+        chunkList.append(tempList)
+        return chunkList
+    #def
+
+    def getRISDeviceStatus(self, phones:list):
+        """Query RIS API for device status information
+
+        Args:
+            phones (list): An RIS chunk to process
+        """
+        disable_warnings(InsecureRequestWarning)
+        risWSDL = f'https://{self._hostname}:8443/realtimeservice2/services/RISService70?wsdl'
+        risLocation = f'https://{self._hostname}:8443/realtimeservice2/services/RISService70'
+        risBinding = '{http://schemas.cisco.com/ast/soap}RisBinding'
+        risSession = Session()
+        risSession.verify = False
+        risSession.auth = HTTPBasicAuth(self._username, self._password)
+        risTransport = Transport(cache=SqliteCache(), session=risSession, timeout=20)
+        risHistory = HistoryPlugin()
+        risClient = Client(wsdl=risWSDL, transport=risTransport, plugins=[risHistory])
+        ris = risClient.create_service(risBinding, risLocation)
         criteria = {
-            'MaxReturnedDevices': '900',
+            'MaxReturnedDevices': f'{len(phones)}',
             'DeviceClass': 'Phone',
             'Model': '255',
             'Status': 'Any',
             'NodeName': '',
             'SelectBy': 'Name',
             'SelectItems': {
-                'item': ris_phones
+                'item': phones
             },
             'Protocol': 'Any',
             'DownloadStatus': 'Any'
         }
         risDevices = ris.selectCmDeviceExt(CmSelectionCriteria=criteria, StateInfo='')['SelectCmDeviceResult']
-        print('AXL Devices: {axl}\tRIS Devices: {ris}'.format(axl=len(ris_phones), ris=risDevices['TotalDevicesFound']))
-        dev_count = 0
         for node in risDevices['CmNodes']['item']:
             for device in node['CmDevices']['item']:
-                progress(count=dev_count, total=risDevices['TotalDevicesFound'], status=device.Name)
-                dev_count += 1
-                hw_phones[device.Name]['Status'] = device.Status
-                hw_phones[device.Name]['ActiveLoadID'] = device.ActiveLoadID
-                hw_phones[device.Name]['InactiveLoadID'] = device.InactiveLoadID
-                hw_phones[device.Name]['IPAddress'] = next((IP for IP in device.IPAddress['item'] if IP['IPAddrType'] == 'ipv4'), None)
-                if hw_phones[device.Name]['IPAddress'] != None:
-                    hw_phones[device.Name]['IPAddress'] = hw_phones[device.Name]['IPAddress']['IP']
-                    try:
-                        devInfo = requests.get('http://{ip}/DeviceInformationX'.format(ip=hw_phones[device.Name]['IPAddress']), timeout=5)
-                        devXML = etree.fromstring(bytes(devInfo.text, encoding='utf8'))
-                        udi = devXML.xpath('//udi/text()')[0]
-                        match = re.search(r'.*(CP-.+).(V\d+).(.+).', udi, re.DOTALL)
-                        if match:
-                            hw_phones[device.Name]['ModelNumber'] = match.group(1)
-                            hw_phones[device.Name]['HardwareRevision'] = match.group(2)
-                            hw_phones[device.Name]['SerialNumber'] = match.group(3)
-                        #if
-                    except requests.exceptions.Timeout:
-                        hw_phones[device.Name]['Error'] = "Request Timeout: ensure phone IP is reachable"
-                    except requests.exceptions.ConnectionError:
-                        hw_phones[device.Name]['Error'] = "Connection Error: ensure phone WebAccess is enabled"
-                    except requests.exceptions.RequestException as e:
-                        hw_phones[device.Name]['Error'] = "Request Exception: request was not properly understood"
-                    #try
+                self._phoneData[device.Name]['Status'] = device.Status
+                self._phoneData[device.Name]['ActiveLoadID'] = device.ActiveLoadID
+                self._phoneData[device.Name]['InactiveLoadID'] = device.InactiveLoadID
+                #grab the item's first IPv4 address, or None
+                self._phoneData[device.Name]['IPAddress'] = next((IP for IP in device.IPAddress['item'] if IP['IPAddrType'] == 'ipv4'), None)
+                if self._phoneData[device.Name]['IPAddress'] is not None:
+                    self._phoneData[device.Name]['IPAddress'] = self._phoneData[device.Name]['IPAddress']['IP']
                 #if
-
-                #write out the result as complete, removing it
-                output.writerow(hw_phones.pop(device.Name))
             #for
         #for
-    #for
-    #write out the phones where RIS data was not found
-    for phone in hw_phones.values():
-        output.writerow(phone)
-    #for
-#main
+    #def
+
+    @staticmethod
+    def getDeviceInformation(phone:dict) -> dict:
+        """Access phone Webpage for hardware device information
+
+        Args:
+            phone (dict): Single phone dict
+
+        Returns:
+            dict: Modified dict
+        """
+        try:
+            devInfo = requests.get(f"http://{phone['IPAddress']}/DeviceInformationX", timeout=5)
+        except requests.exceptions.Timeout:
+            phone['Error'] = "Request Timeout: ensure phone IP is reachable"
+            return phone
+        except requests.exceptions.ConnectionError:
+            phone['Error'] = "Connection Error: ensure phone WebAccess is enabled"
+            return phone
+        except requests.exceptions.RequestException:
+            phone['Error'] = "Request Exception: request was not properly understood"
+            return phone
+        #try
+        devXML = etree.fromstring(bytes(devInfo.text, encoding='utf8'))
+        udi = devXML.xpath('//udi/text()')[0]
+        match = re.search(r'.*(CP-.+).(V\d+).(.+).', udi, re.DOTALL)
+        if match:
+            phone['ModelNumber'] = match.group(1)
+            phone['HardwareRevision'] = match.group(2)
+            phone['SerialNumber'] = match.group(3)
+        #if
+        return phone
+    #def
+
+    def getModelCount(self, model:str) -> int:
+        """Get count of deivces with the given model
+
+        Args:
+            model (str): Model to check against
+
+        Returns:
+            int: Count of Model
+        """
+        return len([phone for phone in self._phoneData.values() if phone['Model'] == model])
+    #def
+
+    def getKeyCount(self, key:str) -> int:
+        """Get count of non-None values for given key
+
+        Args:
+            key (str): Key to check against
+
+        Returns:
+            int: Count of non-None values
+        """
+        return len([phone for phone in self._phoneData.values() if phone[key] is not None])
+    #def
+
+    def export(self):
+        """Export data to CSV
+        """
+        csvOut = csv.DictWriter(open(self._outFile, 'w', encoding='utf8'), fieldnames=self.__DATA_COLUMNS, lineterminator='\n', quoting=csv.QUOTE_ALL)
+        csvOut.writeheader()
+        for phone in self._phoneData.values():
+            csvOut.writerow(phone)
+        #for
+    #def
+
+    def run(self):
+        """Execute the application logic
+        """
+        sys.stdout.write('Gathering AXL Version...')
+        sys.stdout.flush()
+        self.getAxlVersion()
+        print(f' {self._axlVersion}')
+
+        print('Gathering phones with hardware revision requirements...')
+        self.getAxlHwPhones()
+        for model in self.__HW_MODELS:
+            sys.stdout.write(f"{model}: {self.getModelCount(model)}    ")
+            sys.stdout.flush()
+        #for
+        print('\r\nGathering phone RIS data...')
+        risChunks = self.getChunks(self._phoneData.values(), 200)
+        for i,chunk in enumerate(risChunks):
+            progressBar(current=i, total=len(risChunks)-1, status=f'Chunk {i+1} ({len(chunk)} Phones)')
+            self.getRISDeviceStatus(chunk)
+        #for
+        #filter to only phones where IP Address was discovered
+        ipPhones = [ipPhone for ipPhone in self._phoneData.values() if ipPhone['IPAddress'] is not None]
+        print(f'Count of devices with IP address discovered: {len(ipPhones)}')
+        print('Gathering phone hardware data...')
+        for i,ipPhone in enumerate(ipPhones):
+            progressBar(current=i, total=len(ipPhones)-1, status=ipPhone['Name'])
+            self.getDeviceInformation(ipPhone)
+        #for
+        print(f"Count of devices fully discovered: {self.getKeyCount('HardwareRevision')}")
+        print(f"Count of devices with errors: {self.getKeyCount('Error')}")
+        self.export()
+        print("Discovery Complete.")
+    #def
+#class
+
+def main():
+    """Validate arguments as needed, pass to applciation, and run
+
+    Raises:
+        FileNotFoundError: If Schema path is not valid
+        FileExistsError: if the output file already exists
+    """
+    argp = argparse.ArgumentParser(description='Discover Phone Hardware revisions for migration to Webex Calling')
+    argp.add_argument('-s', dest='host', metavar='cucm.example.com', type=str, required=True, help='Server FQDN or IP address')
+    argp.add_argument('-u', dest='username', metavar='axladmin', type=str, required=True, help='Application user with AXL, RIS, and Phone API access')
+    argp.add_argument('-p', dest='password', metavar='@xL!sC00l', type=str, required=True, help='Application user password')
+    argp.add_argument('-a', dest='schemaPath', default='schema', metavar='c:\\path\\to\\schema', type=str, help='Path to AXL Schema files')
+    argp.add_argument('-o', dest='outFile', default='', metavar='c:\\path\\to\\file.csv',  type=str, help='CSV output document')
+    arguments = argp.parse_args()
+
+    if not os.path.isdir(arguments.schemaPath):
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), arguments.schemaPath)
+    #if
+    if os.path.isfile(arguments.outFile):
+        raise FileExistsError(errno.EEXIST,os.strerror(errno.EEXIST), arguments.outFile)
+    #if
+
+    app = Application(arguments)
+    app.run()
+#def
+
+if __name__ == '__main__':
+    main()
+#if
