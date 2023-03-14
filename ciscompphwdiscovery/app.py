@@ -9,22 +9,25 @@
     4. Filter results to 7821, 7861, and 7841 models that are hardware revision restricted from MPP migration
     5. Chunk into blocks of 900 for RISPort70 API query to avoid hitting the 1000 result max
     6. Process each chunk, gathering the registration status, load information, and first IPv4 address
-    7. Gather the Device's hardware UDI info from DeviceInformationX. This is the timeconsuming part, so provide a progress bar for each chunk
+    7. Gather the Device's hardware UDI info from DeviceInformationX. This is the timeconsuming part, Threaded to increase speed
     8. Write the results as found to CSV
     9. Also write any AXL only phones that may be inactive in RIS data
 
  .NOTES
     Author:        Collin Moerman
-    Date:          2023-03-09
-    Version:       2.0
+    Date:          2023-03-13
+    Version:       2.2
 """
 import csv
 import os
 import sys
 import re
 import errno
-import argparse
+import importlib.resources
+from multiprocessing import Pool
+import tempfile
 import requests
+from lxml import etree
 from zeep import Client
 from zeep.cache import SqliteCache
 from zeep.transports import Transport
@@ -33,29 +36,8 @@ from requests import Session
 from requests.auth import HTTPBasicAuth
 from urllib3 import disable_warnings
 from urllib3.exceptions import InsecureRequestWarning
-from lxml import etree
+from tqdm import tqdm
 
-def progressBar(current:int, total:int, status:str='') -> None:
-    """Display a progress bar on console
-
-    Args:
-        current (int): Current progress amount
-        total (int): Total amount to calculate percentage against
-        status (str, optional): Optional message to display after the progress bar. Defaults to ''.
-    """
-    if total == 0:
-        return
-    barLen = 30
-    filledLen = int(round(barLen * current / float(total)))
-    percents = round(100.0 * current / float(total), 1)
-    barFill = '=' * filledLen + ' ' * (barLen - filledLen)
-    if current == total:
-        print(f'\r[{barFill}] {percents:06.2f}%    {status}')
-    else:
-        sys.stdout.write(f'\r[{barFill}] {percents:06.2f}%    {status}\r')
-        sys.stdout.flush()
-    #if
-#def
 
 def getFirstZeepItem(resp):
     """Take Zeep's AXL response format and grab the first item from it, AXL result is in a list with one item
@@ -69,7 +51,63 @@ def getFirstZeepItem(resp):
     return resp['return'][next(iter(resp['return']))]
 #def
 
-class Application:
+def getChunks(fullList:list, chunksize:int=900) -> list:
+    """Take a list and chunk it into multiple lists with a maximum size per list
+
+    Args:
+        fullList (list): Full list of arbitrary length
+        chunksize (int, optional): The maximum size of each list chunk. Defaults to 900.
+
+    Returns:
+        list: List of lists with chunksize limit imposed
+    """
+    chunkList = []
+    tempList = []
+    for phone in fullList:
+        tempList.append(phone['Name'])
+        #Size reached, chunk now
+        if len(tempList) > (chunksize - 1):
+            chunkList.append(tempList)
+            tempList = []
+        #if
+    #for
+    chunkList.append(tempList)
+    return chunkList
+#def
+
+def getDeviceInformationWorker(phone:dict) -> dict:
+    """Access phone Webpage for hardware device information
+
+    Args:
+        phone (dict): Single phone dict
+
+    Returns:
+        dict: Modified dict
+    """
+    try:
+        devInfo = requests.get(f"http://{phone['IPAddress']}/DeviceInformationX", timeout=5)
+    except requests.exceptions.Timeout:
+        phone['Error'] = "Request Timeout: ensure phone IP is reachable"
+        return phone
+    except requests.exceptions.ConnectionError:
+        phone['Error'] = "Connection Error: ensure phone WebAccess is enabled"
+        return phone
+    except requests.exceptions.RequestException:
+        phone['Error'] = "Request Exception: request was not properly understood"
+        return phone
+    #try
+    devXML = etree.fromstring(bytes(devInfo.text, encoding='utf8'))
+    udi = devXML.xpath('//udi/text()')[0]
+    match = re.search(r'.*(CP-.+).(V\d+).(.+).', udi, re.DOTALL)
+    if match:
+        phone['ModelNumber'] = match.group(1)
+        phone['HardwareRevision'] = match.group(2)
+        phone['SerialNumber'] = match.group(3)
+    #if
+    return phone
+#def
+
+class CiscoMPPHWDiscovery:
     """ Applicaton logic """
     __HW_MODELS = [
         "Cisco 7821",
@@ -89,24 +127,32 @@ class Application:
         'HardwareRevision',
         'Error'
     ]
-    def __init__(self, arguments):
-        self._hostname = arguments.host
-        self._username = arguments.username
-        self._password = arguments.password
-        self._outFile = arguments.outFile
-        self._schemaPath = arguments.schemaPath
+    def __init__(self, hostname, username, password, outFile, schemaPath=None, processes=8):
+        self._hostname = hostname
+        self._username = username
+        self._password = password
+
+        if schemaPath is None:
+            with importlib.resources.path("ciscompphwdiscovery", "schema") as schemaPath:
+                self._schemaPath  = str(schemaPath)
+            #with
+        else:
+            self._schemaPath = schemaPath
+        #if
+        
+        #fail upfront on initialization if the file already exists so we dont do all our processing before being unable to create the file
+        if os.path.isfile(outFile):
+            raise FileExistsError(errno.EEXIST,os.strerror(errno.EEXIST), outFile)
+        #if
+
+        self._outFile = outFile
+        self._processes = processes
         self._phoneData = {}
         self._axlVersion = "10.0"  # Default to AXL 10.0 as a minimum version supported
+        self.__cli = False # Run from CLI or module
     #def
 
-    def __str__(self):
-        return "Discover phone hardware revisions for migration to MPP Firmware"
-    #def
-    def __repr__(self):
-        return f'{self._hostname}'
-    #def
-
-    def getAxlVersion(self):
+    def __getAxlVersion(self):
         """Determine CUCM AXL version using UDS API's version string
         """
         disable_warnings(InsecureRequestWarning)
@@ -121,11 +167,11 @@ class Application:
         #if
     #def
 
-    def getAxlHwPhones(self):
+    def __getAxlHwPhones(self):
         """Query AXL for physical (SEP) phones, filter to models with HW revision requirements
         """
         disable_warnings(InsecureRequestWarning)
-        axlWSDL = f'{self._schemaPath}\\{self._axlVersion}\\AXLAPI.wsdl'
+        axlWSDL = os.path.join(self._schemaPath, self._axlVersion, 'AXLAPI.wsdl')
         if not os.path.isfile(axlWSDL):
             raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), axlWSDL)
         #if
@@ -151,32 +197,7 @@ class Application:
         #for
     #def
 
-    @staticmethod
-    def getChunks(fullList:list, chunksize:int=900) -> list:
-        """Take a list and chunk it into multiple lists with a maximum size per list
-
-        Args:
-            fullList (list): Full list of arbitrary length
-            chunksize (int, optional): The maximum size of each list chunk. Defaults to 900.
-
-        Returns:
-            list: List of lists with chunksize limit imposed
-        """
-        chunkList = []
-        tempList = []
-        for phone in fullList:
-            tempList.append(phone['Name'])
-            #Size reached, chunk now
-            if len(tempList) > (chunksize - 1):
-                chunkList.append(tempList)
-                tempList = []
-            #if
-        #for
-        chunkList.append(tempList)
-        return chunkList
-    #def
-
-    def getRISDeviceStatus(self, phones:list):
+    def __getRISDeviceStatus(self, phones:list):
         """Query RIS API for device status information
 
         Args:
@@ -221,40 +242,28 @@ class Application:
         #for
     #def
 
-    @staticmethod
-    def getDeviceInformation(phone:dict) -> dict:
-        """Access phone Webpage for hardware device information
+    def __getDeviceInformation(self, ipPhones:list):
+        """Take a list of phones with IP addresses and check Hardware data. Threaded for speed increase.
+           Calls global function for pickling
 
         Args:
-            phone (dict): Single phone dict
-
-        Returns:
-            dict: Modified dict
+            ipPhones (list): List of Phone data with IP addresses
         """
-        try:
-            devInfo = requests.get(f"http://{phone['IPAddress']}/DeviceInformationX", timeout=5)
-        except requests.exceptions.Timeout:
-            phone['Error'] = "Request Timeout: ensure phone IP is reachable"
-            return phone
-        except requests.exceptions.ConnectionError:
-            phone['Error'] = "Connection Error: ensure phone WebAccess is enabled"
-            return phone
-        except requests.exceptions.RequestException:
-            phone['Error'] = "Request Exception: request was not properly understood"
-            return phone
-        #try
-        devXML = etree.fromstring(bytes(devInfo.text, encoding='utf8'))
-        udi = devXML.xpath('//udi/text()')[0]
-        match = re.search(r'.*(CP-.+).(V\d+).(.+).', udi, re.DOTALL)
-        if match:
-            phone['ModelNumber'] = match.group(1)
-            phone['HardwareRevision'] = match.group(2)
-            phone['SerialNumber'] = match.group(3)
-        #if
-        return phone
+        with Pool(processes=self._processes) as procPool:
+            if(self.__cli):
+                results = list(tqdm(procPool.imap_unordered(getDeviceInformationWorker, ipPhones), total=len(ipPhones)))
+            else:
+                results = list(procPool.imap_unordered(getDeviceInformationWorker, ipPhones))
+            #if
+            procPool.close()
+            procPool.join()
+        #with
+        for result in results:
+            self._phoneData[result['Name']] = result
+        #for
     #def
 
-    def getModelCount(self, model:str) -> int:
+    def __getModelCount(self, model:str) -> int:
         """Get count of deivces with the given model
 
         Args:
@@ -266,7 +275,7 @@ class Application:
         return len([phone for phone in self._phoneData.values() if phone['Model'] == model])
     #def
 
-    def getKeyCount(self, key:str) -> int:
+    def __getKeyCount(self, key:str) -> int:
         """Get count of non-None values for given key
 
         Args:
@@ -278,77 +287,78 @@ class Application:
         return len([phone for phone in self._phoneData.values() if phone[key] is not None])
     #def
 
-    def export(self):
+    def __console(self, data:str, term:str=None):
+        """Print to console only during CLI operation
+
+        Args:
+            data (str): data tp print
+            term (str, optional): Optional terminator string, if None, print will send newline
+        """        
+        if self.__cli:
+            print(data, end=term)
+    #def
+
+    def __export(self):
         """Export data to CSV
         """
-        csvOut = csv.DictWriter(open(self._outFile, 'w', encoding='utf8'), fieldnames=self.__DATA_COLUMNS, lineterminator='\n', quoting=csv.QUOTE_ALL)
-        csvOut.writeheader()
-        for phone in self._phoneData.values():
-            csvOut.writerow(phone)
+        with open(self._outFile, 'w', encoding='utf8') as ouput:
+            csvOut = csv.DictWriter(ouput, fieldnames=self.__DATA_COLUMNS, lineterminator='\n', quoting=csv.QUOTE_ALL)
+            csvOut.writeheader()
+            csvOut.writerows(self._phoneData.values())
+        #with
+        self.__console(f"Wrote data to {self._outFile}")
+    #def
+
+    def discover(self) ->list:
+        """Execute discovery and return results
+
+        Returns:
+            list: the discovered results as a list of dict
+        """
+        self.__console('Gathering AXL Version...', term='')
+        self.__getAxlVersion()
+        self.__console(f" {self._axlVersion}")
+
+        self.__console('Gathering phones with hardware revision requirements...')
+        self.__getAxlHwPhones()
+        for model in self.__HW_MODELS:
+            self.__console(f"{model}: {self.__getModelCount(model)}", term ='    ')
         #for
+        self.__console('')
+
+        #return empty list
+        if len(self._phoneData.keys()) == 0:
+            return self._phoneData.values()
+                
+        self.__console('Gathering phone RIS data...')
+        risChunks = getChunks(self._phoneData.values())
+        if self.__cli:
+            for chunk in tqdm(risChunks):
+                self.__getRISDeviceStatus(chunk)
+            #for
+        else:
+            for chunk in risChunks:
+                self.__getRISDeviceStatus(chunk)
+            #for
+        #if
+
+        #filter to only phones where IP Address was discovered
+        ipPhones = [ipPhone for ipPhone in self._phoneData.values() if ipPhone['IPAddress'] is not None]
+        self.__console(f"Count of devices with IP address discovered: {len(ipPhones)}")
+        self.__console('Gathering phone hardware data...')
+        self.__getDeviceInformation(ipPhones)
+        self.__console(f"Count of devices fully discovered: {self.__getKeyCount('HardwareRevision')}")
+        self.__console(f"Count of devices with errors: {self.__getKeyCount('Error')}")
+        self.__console('Discovery Complete')
+
+        return list(self._phoneData.values())
     #def
 
     def run(self):
-        """Execute the application logic
-        """
-        sys.stdout.write('Gathering AXL Version...')
-        sys.stdout.flush()
-        self.getAxlVersion()
-        print(f' {self._axlVersion}')
-
-        print('Gathering phones with hardware revision requirements...')
-        self.getAxlHwPhones()
-        for model in self.__HW_MODELS:
-            sys.stdout.write(f"{model}: {self.getModelCount(model)}    ")
-            sys.stdout.flush()
-        #for
-        print('\r\nGathering phone RIS data...')
-        risChunks = self.getChunks(self._phoneData.values(), 200)
-        for i,chunk in enumerate(risChunks):
-            progressBar(current=i, total=len(risChunks)-1, status=f'Chunk {i+1} ({len(chunk)} Phones)')
-            self.getRISDeviceStatus(chunk)
-        #for
-        #filter to only phones where IP Address was discovered
-        ipPhones = [ipPhone for ipPhone in self._phoneData.values() if ipPhone['IPAddress'] is not None]
-        print(f'Count of devices with IP address discovered: {len(ipPhones)}')
-        print('Gathering phone hardware data...')
-        for i,ipPhone in enumerate(ipPhones):
-            progressBar(current=i, total=len(ipPhones)-1, status=ipPhone['Name'])
-            self.getDeviceInformation(ipPhone)
-        #for
-        print(f"Count of devices fully discovered: {self.getKeyCount('HardwareRevision')}")
-        print(f"Count of devices with errors: {self.getKeyCount('Error')}")
-        self.export()
-        print("Discovery Complete.")
+        """CLI mode: run discovery and save to file
+        """        
+        # self.__cli = True
+        self.discover()
+        self.__export()
     #def
 #class
-
-def main():
-    """Validate arguments as needed, pass to applciation, and run
-
-    Raises:
-        FileNotFoundError: If Schema path is not valid
-        FileExistsError: if the output file already exists
-    """
-    argp = argparse.ArgumentParser(description='Discover Phone Hardware revisions for migration to Webex Calling')
-    argp.add_argument('-s', dest='host', metavar='cucm.example.com', type=str, required=True, help='Server FQDN or IP address')
-    argp.add_argument('-u', dest='username', metavar='axladmin', type=str, required=True, help='Application user with AXL, RIS, and Phone API access')
-    argp.add_argument('-p', dest='password', metavar='@xL!sC00l', type=str, required=True, help='Application user password')
-    argp.add_argument('-a', dest='schemaPath', default='schema', metavar='c:\\path\\to\\schema', type=str, help='Path to AXL Schema files')
-    argp.add_argument('-o', dest='outFile', default='', metavar='c:\\path\\to\\file.csv',  type=str, help='CSV output document')
-    arguments = argp.parse_args()
-
-    if not os.path.isdir(arguments.schemaPath):
-        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), arguments.schemaPath)
-    #if
-    if os.path.isfile(arguments.outFile):
-        raise FileExistsError(errno.EEXIST,os.strerror(errno.EEXIST), arguments.outFile)
-    #if
-
-    app = Application(arguments)
-    app.run()
-#def
-
-if __name__ == '__main__':
-    main()
-#if
